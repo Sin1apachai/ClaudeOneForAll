@@ -1,74 +1,53 @@
 ---
-name: wms-testing
-description: Engineering standards for testing the WMS SaaS — unit tests, smoke tests, and automation tests (integration, contract, e2e, load). Use this skill whenever writing, reviewing, running, or debugging ANY test for this project: Go `_test.go` files, the smoke-test script, testcontainers integration tests, Playwright e2e, or CI test config. Consult it even for a small test, because this codebase has correctness rules that MUST be guarded by tests (tenant isolation via RLS, no-oversell, the reserved-quantity invariant, idempotency) — an untested tenant-scoped change is a data-leak risk. If a change touches tenant data, inventory/stock, or adds an endpoint, a test is required.
+name: testing
+description: Best-practice standards for testing software — unit tests, smoke tests, and automation tests (integration, contract, e2e, load). Use this skill whenever writing, reviewing, running, or debugging tests. It encodes general, reusable testing practices; the project's specific critical invariants and mandatory tests live in its docs.
 ---
 
-# WMS Testing
+# Testing
 
-How we keep a multi-tenant inventory system correct. Pairs with `docs/Test-Strategy.md`. Three layers, named as the team uses them: **unit**, **smoke**, **automation**.
+Reusable testing standards. Tests exist first to protect the few failure modes that would seriously hurt the product — identify those and guard them above all.
 
-## Plan-first workflow (before writing tests)
+## Plan-first workflow
 
-1. **State what you're protecting** in one line, and which failure it prevents (cross-tenant leak? oversell? wrong state transition?).
-2. **Pick the right layer.** Unit for pure logic; integration for anything touching SQL / RLS / locks; smoke for a running-system path; e2e for an operator flow. Testing at the wrong layer gives false confidence — RLS and locking break *only* against real Postgres, never against a mock.
-3. **Reuse the existing template** (the tenant-isolation test, the smoke script) instead of inventing a new shape.
-4. **For tenant-scoped or stock-mutating changes a test is not optional** — write it in the same PR.
+1. State what behavior you're protecting and which failure it prevents.
+2. Pick the right layer (below). Testing at the wrong layer gives false confidence — things that only break against a real database/network must be tested there, not against mocks.
+3. Reuse existing test templates instead of inventing a new shape.
+4. For changes to critical or shared logic, a test is not optional — write it in the same PR.
 
-## Philosophy
+## The three layers
 
-The two failure modes that can kill the business are **cross-tenant data leakage** and **overselling stock**. Tests exist first to guard these; everything else is secondary. Prefer real Postgres over mocks wherever correctness depends on the database.
+**Unit** — fast, in-memory, no DB/network. Test pure logic, transformations, validation, and state transitions. Table-driven; deterministic (no sleeps); run with `-race` (Go) where relevant. Frontend: component/hook tests with mocked I/O.
 
-## 1. Unit tests
+**Smoke** — a thin black-box check that a *running* system's critical paths work end-to-end (health, auth/fail-closed, a happy path, and any security boundary like multi-tenant isolation). Idempotent, uses fresh data per run, fails loudly. Run after every deploy. Extend it whenever you add a user-facing endpoint.
 
-Fast, in-memory, no DB or network. Test domain logic, UoM conversion, state-machine transitions, validation, and pure helpers.
+**Automation** — the CI-gating, repeatable suite:
+- *Integration* against real dependencies (e.g. a real database via testcontainers) — the only place RLS, locking, and triggers can be verified. Run security-sensitive checks as the same low-privilege role the app uses, or they pass falsely.
+- *Contract* — front↔back validated against the API spec.
+- *E2E* — critical user flows, against seeded data.
+- *Load* — throughput and concurrency on hot paths.
 
-- **Go:** table-driven, stdlib `testing`; file `<name>_test.go`; prefer black-box `package <pkg>_test`. Use `t.Parallel()` where safe; no sleeps; deterministic.
-- **Frontend:** Vitest + React Testing Library for components/hooks; mock the `api.ts` client (don't hit a real backend).
-- Run: `cd backend && go test ./...` · `cd frontend && npm test` (add Vitest when components land).
+## Mandatory test patterns (adapt per project)
 
-## 2. Smoke tests
-
-A thin **black-box** check that a *running* system's critical paths work end-to-end. Lives in `scripts/smoke-test.sh`; run via `make smoke` against `make run-backend`.
-
-- Asserts: health, **fail-closed auth** (401 with no tenant), create/list, and **tenant isolation** (A can't see B).
-- Rules: idempotent; fresh random tenants per run; no leftover fixtures that matter; fail loudly with a clear message.
-- Run after **every deploy** and before a demo.
-- **Extend it** whenever you add a user-facing endpoint — one happy path plus the isolation/permission boundary.
-
-## 3. Automation tests
-
-The CI-gating, repeatable suite.
-
-**Integration (testcontainers-go, real Postgres)** — RLS, `SELECT ... FOR UPDATE`, triggers, and the `tenant_id` DEFAULT cannot be mocked. Template: `backend/internal/modules/product/isolation_test.go`. Mandatory (gate the build):
-
-- **Tenant isolation** — one per tenant-scoped table (copy the template): seed tenant A + B, act as B, assert zero of A's rows are visible.
-- **No oversell** — concurrent reserve/pick on the same stock; `available` never goes negative on `internal` locations.
-- **Reserved invariant** — `stock_quant.reserved_quantity == Σ qty of assigned moves`.
+- **Isolation** — for any multi-tenant/scoped table, assert one tenant can never see another's rows.
+- **Invariant under concurrency** — for any "must never go wrong" rule (no oversell, no double-apply), spawn concurrent operations and assert the invariant holds.
 - **Idempotency** — replaying an action with the same key applies once.
-- **Migration** — `up` then `down` runs clean on a fresh DB.
-
-**Contract** — front↔back validated against the OpenAPI spec (when it lands).
-**E2E (Playwright)** — critical operator flows: receive→putaway, pick→pack→ship, against a seeded test warehouse.
-**Load (k6 / Locust)** — scan throughput and concurrent picking.
+- **Migrations** — `up` then `down` runs clean on a fresh DB.
 
 ## Conventions
 
-- **Real Postgres** for anything touching SQL/RLS/locks — never a mock DB.
-- Clean up with `t.Cleanup`; tests never depend on order or shared mutable state.
-- Deterministic data: fixed UUIDs/seeds where assertions need them; random tenants where you only need separation.
-- One theme per test; names read clearly in CI output.
-- Reuse the tenant-isolation template for every new tenant-scoped table — don't reinvent it.
+- Real dependencies where correctness depends on them; never a mock DB for SQL/RLS/locks.
+- Clean up with teardown hooks; no order dependence or shared mutable state.
+- Deterministic data where assertions need it; random separation where you only need uniqueness.
+- One theme per test; names that read clearly in CI output.
 
-## CI gates (`.github/workflows/ci.yml`)
+## CI gates
 
-- `backend` job: lint → build → `go test ./...` (incl. integration). Green required to merge to `main`.
-- `frontend` job: install → build (+ `npm test` when present).
-- Smoke runs as a post-deploy step, not in the unit CI job.
+- Lint → build → unit + integration must pass to merge. Coverage threshold on core logic. Migration up/down clean. Smoke runs post-deploy.
 
 ## Before you commit — checklist
 
-- [ ] New tenant-scoped table has a tenant-isolation test (from the template).
+- [ ] New scoped table has an isolation test (run as the low-privilege role).
 - [ ] New endpoint has a unit/integration test + a smoke case (happy path + boundary).
-- [ ] Stock-mutating logic has a concurrency/no-oversell test and upholds the reserved invariant.
-- [ ] SQL/RLS/lock behavior is tested against real Postgres, not a mock.
-- [ ] `make test` green locally; migrations up+down clean.
+- [ ] Critical invariants have a concurrency test.
+- [ ] SQL/lock/RLS behavior tested against real infrastructure, not mocks.
+- [ ] Tests green locally; migrations up+down clean.
